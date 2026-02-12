@@ -2,14 +2,128 @@
 MongoDB database configuration and setup for Mergington High School API
 """
 
+import os
+from copy import deepcopy
 from pymongo import MongoClient
 from argon2 import PasswordHasher, exceptions as argon2_exceptions
 
-# Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['mergington_high']
-activities_collection = db['activities']
-teachers_collection = db['teachers']
+
+class _UpdateResult:
+    def __init__(self, modified_count):
+        self.modified_count = modified_count
+
+
+class _InMemoryCollection:
+    def __init__(self):
+        self._docs = {}
+
+    def count_documents(self, query):
+        # Avoid materializing all matching documents into a list; just count via iteration
+        return sum(1 for _ in self.find(query))
+
+    def insert_one(self, doc):
+        document = deepcopy(doc)
+        self._docs[document["_id"]] = document
+        return {"inserted_id": document["_id"]}
+
+    def find_one(self, query):
+        if "_id" in query:
+            doc = self._docs.get(query["_id"])
+            return deepcopy(doc) if doc else None
+
+        for doc in self.find(query):
+            return doc
+
+        return None
+
+    def _matches(self, doc, query):
+        if not query:
+            return True
+
+        for key, value in query.items():
+            if key == "_id":
+                if doc.get("_id") != value:
+                    return False
+                continue
+
+            if key == "schedule_details.days":
+                days = doc.get("schedule_details", {}).get("days", [])
+                required = value.get("$in", [])
+                if not any(day in days for day in required):
+                    return False
+                continue
+
+            if key == "schedule_details.start_time":
+                start_time = doc.get("schedule_details", {}).get("start_time")
+                threshold = value.get("$gte")
+                if threshold and (not start_time or start_time < threshold):
+                    return False
+                continue
+
+            if key == "schedule_details.end_time":
+                end_time = doc.get("schedule_details", {}).get("end_time")
+                threshold = value.get("$lte")
+                if threshold and (not end_time or end_time > threshold):
+                    return False
+                continue
+
+            if doc.get(key) != value:
+                return False
+
+        return True
+
+    def find(self, query=None):
+        for doc in self._docs.values():
+            if self._matches(doc, query or {}):
+                yield deepcopy(doc)
+
+    def update_one(self, query, update):
+        document_id = query.get("_id")
+        if document_id not in self._docs:
+            return _UpdateResult(modified_count=0)
+
+        doc = self._docs[document_id]
+        modified = 0
+
+        if "$push" in update:
+            for key, value in update["$push"].items():
+                array = doc.setdefault(key, [])
+                array.append(value)
+                modified = 1
+
+        if "$pull" in update:
+            for key, value in update["$pull"].items():
+                array = doc.get(key, [])
+                new_array = [item for item in array if item != value]
+                if new_array != array:
+                    doc[key] = new_array
+                    modified = 1
+
+        return _UpdateResult(modified_count=modified)
+
+    def aggregate(self, pipeline):
+        days = set()
+        for doc in self._docs.values():
+            schedule_days = doc.get("schedule_details", {}).get("days", [])
+            for day in schedule_days:
+                days.add(day)
+
+        for day in sorted(days):
+            yield {"_id": day}
+
+
+def _create_collections():
+    mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+    try:
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=1000)
+        client.admin.command("ping")
+        db = client["mergington_high"]
+        return db["activities"], db["teachers"]
+    except Exception:
+        return _InMemoryCollection(), _InMemoryCollection()
+
+
+activities_collection, teachers_collection = _create_collections()
 
 # Methods
 
